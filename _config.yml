@@ -10,7 +10,7 @@ header_pages:
 
 style: dark
 
-footer: 'follow on <a href="https://twitter.com/">twitter</a>'
+footer: 'follow on <a href="https://twitter.com/wired0ut">twitter</a>'
 
 # Build settings
 markdown: kramdown
