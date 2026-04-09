@@ -1,4 +1,4 @@
-# CVE 2019-2215 - Part 1 - Android Research Journey
+# Bad Binder - Part 1 - Android Research Journey
 
 Welcome to the second entry in the Android research journey. As you can tell, we'll be diving right in. In the last blog post we've dived a bit into Binder, an important attack vector when you learn android VR. In this entry, we'll begin researching CVE 2019-2215, otherwise known as `Bad Binder`, and exploit it later on. 
 
