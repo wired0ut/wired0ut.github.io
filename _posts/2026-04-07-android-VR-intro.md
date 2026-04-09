@@ -91,7 +91,7 @@ The `write_buffer` and `read_buffer` pointers are userspace buffers containing a
 
 We can look at an example for such a transaction here:
 
-![](../assets/images/blogs/android-vr/binder_transaction.png)
+![](/assets/images/blogs/android-vr/binder_transaction.png)
 
 We don't fully understand everything yet, but we can see that the `write_buffer` points to a bufdfer that contains a list of commands and data. The `BC_TRANSACTION` command tells Binder to send a transaction. The `read_buffer` points to a buffer that will be filled by Binder when there are incoming transactions.
 
