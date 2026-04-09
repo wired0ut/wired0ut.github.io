@@ -1,0 +1,17 @@
+title: 'w1red_'
+description: "pwnnie blog"
+baseurl: "/"
+url: "https://yoavthewk.github.io"
+
+header_pages:
+  - index.md
+  - about.md
+  - contact.md
+
+style: dark
+
+footer: 'follow on <a href="https://twitter.com/">twitter</a>'
+
+# Build settings
+markdown: kramdown
+remote_theme: yoavthewk/jekyll-theme-console
