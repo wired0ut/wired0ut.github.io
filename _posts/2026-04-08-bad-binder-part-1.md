@@ -16,12 +16,6 @@ index a340766b51fe..2ef8bd29e188 100644
                         spin_lock(&t->lock);
         }
 +
-+       /*
-+        * If this thread used poll, make sure we remove the waitqueue
-+        * from any epoll data structures holding it with POLLFREE.
-+        * waitqueue_active() is safe to use here because we're holding
-+        * the inner lock.
-+        */
 +       if ((thread->looper & BINDER_LOOPER_STATE_POLL) &&
 +           waitqueue_active(&thread->wait)) {
 +               wake_up_poll(&thread->wait, POLLHUP | POLLFREE);
@@ -268,47 +262,30 @@ static int binder_open(struct inode *nodp, struct file *filp)
 
 We can therefore see that it simply initializes the `binder_proc` fields, and creates a Binder entry for the process.
 
-Now that we have some more information, we should take a look at what the comment in the patch says:
+Now, let's take a look at the diff again and try to understand what it does. 
+We know it is in the function that runs when a `binder_thread` is destroyed, and it adds the following functionality:
 ```c
-/*
-If this thread used poll, make sure we remove the waitqueue
-from any epoll data structures holding it with POLLFREE.
-waitqueue_active() is safe to use here because we're holding
-the inner lock.
-*/
+if ((thread->looper & BINDER_LOOPER_STATE_POLL) && waitqueue_active(&thread->wait)) {
+    wake_up_poll(&thread->wait, POLLHUP | POLLFREE);
+}
 ```
 
-Okay, so it seems as if the UAF happens when the thread `poll`s the `ioctl`. After researching for a bit, I have found that when a thread uses `poll`, `epoll`, etc., the function that is called is `binder_poll`:
+Let's start by disecting the `if`. The first clause is `thread->looper & BINDER_LOOPER_STATE_POLL`. If we telescope it in the source we can see the following:
 ```c
 static unsigned int binder_poll(struct file *filp,
 				struct poll_table_struct *wait)
 {
-  // --> get binder_proc.
-	struct binder_proc *proc = filp->private_data;
-	struct binder_thread *thread = NULL;
-	bool wait_for_proc_work;
-	
-	// --> get specific process binder_thread.
+  ...
 	thread = binder_get_thread(proc);
-
-	binder_inner_proc_lock(thread->proc);
 	thread->looper |= BINDER_LOOPER_STATE_POLL;
-	wait_for_proc_work = binder_available_for_proc_work_ilocked(thread);
-	binder_inner_proc_unlock(thread->proc);
-	
-	// --> thread sleeps until it is signaled.
-	poll_wait(filp, &thread->wait, wait);
-
-	if (binder_has_work(thread, wait_for_proc_work))
-		return POLLIN;
-
-	return 0;
+	...
 }
 ```
 
-As we can see, the `binder_thread` has a `wait_queue` that it uses to wait until there's work to do (when polling). From the kernel patch we can also tell that the wait queue is relevant here.
+Therefore, it seems to check whether or not the `thread` in a state of polling. 
+The second part seems pretty straightforward from the function name, but it seems to check whether the `thread->wait` queue is active.
 
-Just to provide some extra information, the `wait` field is also used when we perform a synchronous `BINDER_WRITE_READ` with a transaction, as Binder sets our thread to sleep while it waits for the target process reply. 
+The `binder_thread` has a wait queue that it uses to be signaled when there's work to do while polling. It is also used when we perform a synchronous `BINDER_WRITE_READ` with a transaction, as Binder sets our thread to sleep while it waits for the target process reply, but for know we'll focus on the polling.
 
 But.. What is a wait queue? 
 
@@ -459,9 +436,55 @@ Practically, it iterates over each entry in the wait queue and calls its `func` 
 
 Now, we know the CVE is directly related to `binder_poll`. When we call `epoll_ioctl(...)` on the `ioctl` of the driver, eventually we reach a state in which we interact with a wait queue (`poll_wait(filp, &thread->wait, wait);`). Now that we have all of this information, let's try and disect what exactly happens there. 
 
-The patch specifically suggests that there's a case in which the `waitqueue` is not removed from a certain `epoll` data structure that, when the `waitqueue` is freed, causes a UAF.
+The patch tells us that when we clean up a `binder_thread`, if the `thread` is being polled and there's a wait queue active, we should:
+```c
+wake_up_poll(&thread->wait, POLLHUP | POLLFREE);
+```
 
-Let's trace back a little bit. The first thing we must understand is how the threads `waitqueue` is destroyed. That is actually a pretty simple logic. At the end of  `binder_thread_release`, there's this call:
+Which does this:
+```c
+...
+/*
+ * This is the callback that is passed to the wait queue wakeup
+ * mechanism. It is called by the stored file descriptors when they
+ * have events to report.
+ */
+// --> This is the `func` we've seen before.
+static int ep_poll_callback(wait_queue_entry_t *wait, unsigned mode, int sync, void *key)
+{
+	int pwake = 0;
+	unsigned long flags;
+	struct epitem *epi = ep_item_from_wait(wait);
+	struct eventpoll *ep = epi->ep;
+	int ewake = 0;
+
+	spin_lock_irqsave(&ep->lock, flags);
+
+	...
+
+	if ((unsigned long)key & POLLFREE) {
+		/*
+		 * If we race with ep_remove_wait_queue() it can miss
+		 * ->whead = NULL and do another remove_wait_queue() after
+		 * us, so we can't use __remove_wait_queue().
+		 */
+		list_del_init(&wait->entry);
+		/*
+		 * ->whead != NULL protects us from the race with ep_free()
+		 * or ep_remove(), ep_remove_wait_queue() takes whead->lock
+		 * held by the caller. Once we nullify it, nothing protects
+		 * ep/epi or even wait.
+		 */
+		smp_store_release(&ep_pwq_from_wait(wait)->whead, NULL);
+	}
+	
+	...
+
+	return ewake;
+}
+```
+
+The patch specifically suggests that there's a case in which the `waitqueue` is not removed from a certain data structure that, when the `waitqueue` is freed, causes a UAF. Let's trace back a little bit. The first thing we must understand is how the threads `waitqueue` is destroyed. That is actually a pretty simple logic. At the end of  `binder_thread_release`, there's this call:
 ```c
     binder_thread_dec_tmpref(thread);
 ```
