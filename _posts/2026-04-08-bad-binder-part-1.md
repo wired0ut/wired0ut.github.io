@@ -27,9 +27,9 @@ index a340766b51fe..2ef8bd29e188 100644
 Let's fetch the commit and check it out:
 ```bash
 # This is needed if you did a shallow clone.
-git fetch origin 7a3cee43e935b9d526ad07f20bf005ba7e74d05b
+git fetch origin 550c01d0e051461437d6e9d72f573759e7bc5047
 # Checkout the one before it
-git checkout 7a3cee43e935b9d526ad07f20bf005ba7e74d05b~1
+git checkout 550c01d0e051461437d6e9d72f573759e7bc5047~1
 
 # Build android kernel with debugging enabled.
 make ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu- defconfig
