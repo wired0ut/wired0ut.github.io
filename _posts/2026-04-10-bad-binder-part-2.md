@@ -520,7 +520,7 @@ $2 = {
     bc = {
         counter = 0x0
       } <repeats 19 times>},
-    obj_created = {{
+    obj_created = {
         counter = 0x0
       }, {
         counter = 0x0
@@ -535,7 +535,7 @@ $2 = {
       }, {
         counter = 0x0
       },
-    obj_deleted = {{
+    obj_deleted = {
         counter = 0x0
       }, {
         counter = 0x0
@@ -549,7 +549,7 @@ $2 = {
         counter = 0x0
       }, {
         counter = 0x0
-      }}
+      }
   },
   tmp_ref = {
     counter = 0x0
