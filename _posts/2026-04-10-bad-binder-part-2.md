@@ -514,10 +514,10 @@ $2 = {
     }
   },
   stats = {
-    br = {{
+    br = {
         counter = 0x0
       } <repeats 18 times>},
-    bc = {{
+    bc = {
         counter = 0x0
       } <repeats 19 times>},
     obj_created = {{
@@ -534,7 +534,7 @@ $2 = {
         counter = 0x0
       }, {
         counter = 0x0
-      }},
+      },
     obj_deleted = {{
         counter = 0x0
       }, {
