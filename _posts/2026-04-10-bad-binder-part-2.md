@@ -198,7 +198,7 @@ assert(PIPE_CAPACITY == write(pipefd[1], fill_buffer, PIPE_CAPACITY));
 
 At this point, it's worth noting that the code above simply forces the pipe to be blocked in order for the `writev` call to block, forcing the kernel allocation to not be freed.
 
-Now, at this point we want to create `iovec` allocations in order to reach `kmalloc-512`. The struct size is trivially 16, meaning we need `512/16 = 32` `iovec` objects. When testing I noticed that using 32 `iovec`s did not work to be allocated in `kmalloc-512`, so I simply used 24 instead, which did as they land in the 512 bucket.
+Now, at this point we want to create `iovec` allocations in order to reach `kmalloc-512`. The struct size is trivially 16, meaning we need `512/16 = 32` `iovec` objects. Due to metadata (those interested may go look around `import_iovec`), using 32 is too much, so I simply used 24 instead, which also lands in the 512 bucket.
 
 Let's create them:
 ```c
@@ -434,7 +434,7 @@ This simply only initializes only the `iovec`s we care about. Let's check it out
 
 All that's left now is, in the main thread, to call `read` and free the pipe so we can read the leak:
 ```c
-#define TASK_STRUCT_OFFSET 0x1d
+#define TASK_STRUCT_OFFSET 0x1d // can be deduced from pahole / debugging
 
 void *__leak_taskstruct(void) {
   uint64_t binder_thread_leak_buffer[BUFFER_SIZE / sizeof(uint64_t)];
@@ -571,6 +571,6 @@ Continue and observe the output of our exploit:
 Leaked task_struct @ 0xffff8000faa60c80
 ```
 
-Successfully leaked `task_struct`, what may we do from now?
+Successfully leaked `task_struct`, what may we do from now? Hmmmmmm...
 
 In the next entry, we'll achieve full LPE, and release a full POC to exploit it. This has been a very fun to write entry. `Till next time.
