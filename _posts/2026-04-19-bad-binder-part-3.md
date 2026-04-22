@@ -376,7 +376,7 @@ void *do_generic_uaf(void *(*thread_routine)(void *), void *(*callback)(void)) {
 }
 ```
 
-The `thread_routine` in the leak, for example, is the function that creates the `iovec`s and performs the `writev` to block, while `do_generic_uaf` performs the UAF itself after `SYNC_WAIT * 2` seconds.
+The `thread_routine` in the leak, for example, is the function that creates the `iovec`s and performs the `writev` to block, while `do_generic_uaf` performs the UAF itself after `SYNC_WAIT` seconds.
 
 We need to implement a `thread_routine` for our write primitive now. The first thing we need to do is initiate two unix sockets:
 ```c
@@ -402,6 +402,7 @@ iov[12].iov_len = sizeof(uint64_t);
 
 struct msghdr msg = {.msg_iov = iov, .msg_iovlen = NUM_IOVECS};
 ```
+(don't get some of the values? It'll be cleared up soon enough).
 
 And `recvmsg` with `MSG_WAITALL`:
 ```c
